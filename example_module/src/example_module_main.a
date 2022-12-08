@@ -1,0 +1,372 @@
+/**
+ *Petrovski Aleksandar RA211-2019
+ *zadatak 57
+ *model 4 / final
+ */
+/** @file example_module_main.c
+ *
+ *  This file defines the actual implementation of the functions for 
+ *  example_module.
+ */
+
+	.include "dsplib/os_asm.h" # include the definition of ROM functions and OS global variables
+	.include "example_module_mcv.h"
+
+_LEFT_CH		.equ 0
+_RIGHT_CH		.equ 1
+_CENTER_CH		.equ 2
+_LS_CH			.equ 3
+_RS_CH			.equ 4
+_VIRT_CH		.equ 5		#not used as output, just as helper
+_BLOCK_SIZE		.equ 16
+
+	.extern _second_order_IIR
+	.public example_module_MCV
+  
+####################### MCV #########################
+# The module control vector is a set of Y data variables
+# that can be accessed through host communication.
+#
+example_module_Y_Segment	.ydata_ovly
+	.public example_module_HOST_MCV
+
+_history_l_lpf_11_x		.bsc (2), 0
+_history_l_lpf_11_y		.bsc (2), 0
+_history_l_hpf_5		.bsc (4), 0
+_history_l_hpf_3		.bsc (4), 0
+_history_r_lpf_11_x		.bsc (2), 0
+_history_r_lpf_11_y		.bsc (2), 0
+_history_r_hpf_5		.bsc (4), 0
+_history_r_hpf_3		.bsc (4), 0
+
+example_module_HOST_MCV MCV_T(.streval(STRUCTURE_INITIALIZATION_STRNG))
+
+#-------------------- end of MCV ---------------------
+
+# Copy of MCV in Xmem
+example_module_X_Segment	.xdata_ovly
+example_module_MCV	MCV_T		# This is a copy of MCV used by algorithm
+
+example_module_MCV_end
+
+_enable					.dw (1)
+
+_variablesGain			.bsc (2), 0.891251 
+
+_lpf_11khz				.dw (0.15084373975), (0.3016874795), (0.15084373975), (-0.05410662294), (0.15748158255)
+
+						
+_hpf_5khz				.dw (0.33340360927), (-0.66680721855), (0.33340360927), (-0.58209971353), (0.25152526647)
+_hpf_3khz				.dw (0.39620449408), (-0.79240898817), (0.39620449408), (-0.75784221753), (0.32697523018)
+
+MINUS_1DB				.dw (0.891251)
+MINUS_10DB				.dw (0.316228)
+MINUS_9C5DB				.dw (0.334965)
+MINUS_4DB				.dw (0.630957)
+MINUS_3C9DB				.dw (0.638263)
+
+
+	.code_ovly
+##################################################################################
+## Called from the Brick or Foreground ISR whenever there 
+## is one or more bricks of unprocessed PCM in the IO Buffer.
+##
+## This function can process only one brick of any channel, but all channels are available
+##
+## This function is inherently an in-place processor -- the input data and output
+## data are in the same IO buffer.
+##
+## There is an array of I/O buffer pointers, located at YMEM addresses ___X_BY_IOBUFFER_PTRS
+## These pointers will point at block N for all channels when this function is 
+## called.
+#################################################################################
+##trashes: x0, y0, a0, a1, b0, i0, 14, 15
+	.public X_S_example_module_Brick
+X_S_example_module_Brick:
+
+	a0 = xmem[_enable]
+	a0 & a0
+	if (a == 0) jmp X_S_example_module_Brick_Done
+	#first block - pregain left
+		i4 = ymem[___X_BY_IOBUFFER_PTRS]								#i4->pout left
+		x0 = xmem[_variablesGain]
+		y0 = ymem[i4]; i4+=1
+		do (_BLOCK_SIZE), >loop								
+			a0 = x0 * y0; y0 = ymem[i4]; i4-=1 							#sample * gain, prepare next sample
+%loop:		ymem[i4] = a0; i4+=2
+	#first block - pregain right
+		i4 = ymem[___X_BY_IOBUFFER_PTRS + _RIGHT_CH]					#i4->pout right
+		x0 = xmem[_variablesGain + 1]
+		y0 = ymem[i4]; i4+=1
+		do (_BLOCK_SIZE), >loop
+			a0 = x0 * y0; y0 = ymem[i4]; i4-=1 							#sample * gain, prepare next sample
+%loop:		ymem[i4] = a0; i4+=2
+	#second block - IIR LS channel
+		i2 = ymem[___X_BY_IOBUFFER_PTRS + _LEFT_CH]						#i2->pout left
+		i4 = (_history_l_lpf_11_x)										#i4->histx
+		i3 = ymem[___X_BY_IOBUFFER_PTRS + _LS_CH]						#i3->pout ls
+		i5 = (_history_l_lpf_11_y)										#i5->histy
+		do (_BLOCK_SIZE), >loop
+			i0 = (_lpf_11khz)											
+			a0 = ymem[i2]; i2+=1
+			call _second_order_IIR		
+%loop:		ymem[i3] = a0; i3+=1
+	#second block - IIR RS channel
+		i2 = ymem[___X_BY_IOBUFFER_PTRS + _RIGHT_CH]					#i2->pout left
+		i4 = (_history_r_lpf_11_x)										#i4->histx
+		i3 = ymem[___X_BY_IOBUFFER_PTRS + _RS_CH]						#i3->pout rs
+		i5 = (_history_r_lpf_11_y)										#i5->histy
+		do (_BLOCK_SIZE), >loop
+			i0 = (_lpf_11khz)
+			a0 = ymem[i2]; i2+=1
+			call _second_order_IIR		
+%loop:		ymem[i3] = a0; i3+=1
+	#third block - left times MINUS_10DB -> center
+		i4 = ymem[___X_BY_IOBUFFER_PTRS + _LEFT_CH]						#i4->pout left
+		i5 = ymem[___X_BY_IOBUFFER_PTRS + _CENTER_CH]					#i5->pout center
+		x0 = xmem[MINUS_10DB]
+		y0 = ymem[i4]; i4+=1; 											#take sample
+		do (_BLOCK_SIZE), >loop													
+			a0 = x0 * y0; y0 = ymem[i4]; i4+=1;							#sample * gain, prepare next sample
+%loop:		ymem[i5] = a0; i5+=1										#write back
+	#third block - right times MINUS_9C5DB -> virtual
+		i4 = ymem[___X_BY_IOBUFFER_PTRS + _RIGHT_CH]					#i4->pout right
+		i5 = ymem[___X_BY_IOBUFFER_PTRS + _VIRT_CH]						#i5->pout virtual
+		x0 = xmem[MINUS_9C5DB] 
+		y0 = ymem[i4]; i4+=1;											#take next sample
+		do (_BLOCK_SIZE), >loop
+			a0 = x0 * y0; y0 = ymem[i4]; i4+=1;							#sample * gain, prepare next sample
+%loop:		ymem[i5] = a0; i5+=1										#write back
+	#third block - IIR center channel
+		i2 = ymem[___X_BY_IOBUFFER_PTRS + _CENTER_CH]					#i2->pout center
+		i4 = (_history_l_hpf_5)											#set history ptrs
+		i5 = (_history_l_hpf_5 + 2)
+		do (_BLOCK_SIZE), >loop
+			i0 = (_hpf_5khz)
+			a0 = ymem[i2];
+			call _second_order_IIR		
+%loop:		ymem[i2] = a0; i2+=1
+	#third block - IIR virtual channel
+		i2 = ymem[___X_BY_IOBUFFER_PTRS + _VIRT_CH]						#i2->pout virt
+		i4 = (_history_r_hpf_5)											#set history ptrs
+		i5 = (_history_r_hpf_5 + 2)
+		do (_BLOCK_SIZE), >loop
+			i0 = (_hpf_5khz)
+			a0 = ymem[i2];
+			call _second_order_IIR		
+%loop:		ymem[i2] = a0; i2+=1
+	#fourth block - ls times MINUS_4DB -> left
+		i4 = ymem[___X_BY_IOBUFFER_PTRS + _LS_CH]						#i4->pout ls
+		i5 = ymem[___X_BY_IOBUFFER_PTRS + _LEFT_CH]						#i5->pout left
+		x0 = xmem[MINUS_4DB] 
+		y0 = ymem[i4]; i4+=1;											#take sample
+		do (_BLOCK_SIZE), >loop
+			a0 = x0 * y0; y0 = ymem[i4]; i4+=1;							#sample * gain, prepare next sample
+%loop:		ymem[i5] = a0; i5+=1;										#write back
+	#fourth block - rs times MINUS_3C9DB -> right
+		i4 = ymem[___X_BY_IOBUFFER_PTRS + _RS_CH]						#i4->pout rs
+		i5 = ymem[___X_BY_IOBUFFER_PTRS + _RIGHT_CH]					#i5->pout right
+		x0 = xmem[MINUS_3C9DB] 
+		y0 = ymem[i4]; i4+=1;											#take sample
+		do (_BLOCK_SIZE), >loop
+			a0 = x0 * y0; y0 = ymem[i4]; i4+=1;							#sample * gain, prepare next sample
+%loop:		ymem[i5] = a0; i5+=1
+	#fourth block - IIR left channel
+		i2 = ymem[___X_BY_IOBUFFER_PTRS + _LEFT_CH]						#i2->pout left
+		i4 = (_history_l_hpf_3)											#set history ptrs
+		i5 = (_history_l_hpf_3 + 2)
+		do (_BLOCK_SIZE), >loop
+			i0 = (_hpf_3khz)
+			a0 = ymem[i2];
+			call _second_order_IIR		
+%loop:		ymem[i2] = a0; i2+=1
+	#fourth block - IIR right channel
+		i2 = ymem[___X_BY_IOBUFFER_PTRS + _RIGHT_CH]					#i2->pout rigth
+		i4 = (_history_r_hpf_3)											#set history ptrs
+		i5 = (_history_r_hpf_3 + 2)
+		do (_BLOCK_SIZE), >loop
+			i0 = (_hpf_3khz)
+			a0 = ymem[i2];
+			call _second_order_IIR		
+%loop:		ymem[i2] = a0; i2+=1
+	#fifth block - accum center to left
+		i5 = ymem[___X_BY_IOBUFFER_PTRS + _LEFT_CH]						#i5->pout left
+		i4 = ymem[___X_BY_IOBUFFER_PTRS + _CENTER_CH]					#i4->pout center
+		a0 = ymem[i5]; i5+=1											#take sample
+		do (_BLOCK_SIZE), >loop
+			b0 = ymem[i4]; i4+=1
+			a1 = a0 + b0; a0 = ymem[i5]; i5-=1							#accum, prepare next sample
+%loop:		ymem[i5] = a1; i5+=2
+	#fifth block - accum virtual to right
+		i5 = ymem[___X_BY_IOBUFFER_PTRS + _RIGHT_CH]
+		i4 = ymem[___X_BY_IOBUFFER_PTRS + _VIRT_CH]
+		a0 = ymem[i5]; i5+=1
+		do (_BLOCK_SIZE), >loop
+			b0 = ymem[i4]; i4+=1
+			a1 = a0 + b0; a0 = ymem[i5]; i5-=1
+%loop:		ymem[i5] = a1; i5+=2	
+
+# end of brick function
+X_S_example_module_Brick_Done:
+  ret
+
+###############################################################################
+## Called from the Brick or Foreground ISR
+## This function gets called on frame boundaries (integer multiples of sample-blocks)
+##   Example 1:  AAC Frame-size is 1024 samples
+##   Example 2:  Our PCM frame-size was chosen to be 256 samples
+##
+## Use this as another place to act on MCV changes.  This is called more often than
+## the Timer functions, but is only called when the DAO clocks are active (only an issue 
+## with Decoder chips)
+###############################################################################
+	.public X_S_example_module_Frame
+X_S_example_module_Frame:
+#   <your code here>
+X_S_example_module_Frame_done:
+  ret           
+
+
+###############################################################################
+## Called from the Brick or Foreground ISR
+## Called only when the Timer flag is set (gets set by the Timer ISR)
+## Use this to act on MCV changes when the block and frame functions are not being called,
+## e.g. when there is no input audio signal.
+###############################################################################
+	.public X_S_example_module_Timer
+X_S_example_module_Timer:
+#   <your code here>
+X_S_example_module_Timer_done:
+  ret
+
+###############################################################################
+## Called from an infinite-loop in the main body of the OS code
+## Can be interrupted, so exercise caution when using global vars that are 
+## used in the foreground ISR
+###############################################################################
+	.public X_S_example_module_Background
+X_S_example_module_Background:
+
+# SAMPLE CODE:
+#	MCV used as a shadow copy on host MCV
+#   This code will copy module_test_HOST_MCV to module_test_MCV
+#	i0 = (example_module_HOST_MCV)
+#	i1 = (example_module_MCV)
+#	nm0 = (1)
+#	nm1 = (1)
+#	do(sizeof(MCV_T)), >
+#		a0 = ymem[i0]; i0 += n
+#%		xmem[i1] = a0; i1 += n
+	#watch out, nothing is written from host
+	x0 = ymem[example_module_HOST_MCV.enable]
+	x1 = ymem[example_module_HOST_MCV.gain_left]
+	x2 = ymem[example_module_HOST_MCV.gain_right]
+	
+	xmem[_enable] = x0
+	xmem[_variablesGain] = x1
+	xmem[_variablesGain + 1] = x2
+
+#   <your code here>
+X_S_example_module_Background_Done:
+  ret
+
+##################################################################################
+## Called from the Brick or Foreground ISR
+## Used for requesting memory from the heap
+## Called immediately after the frame functions are called and immediately prior 
+## to the PostMalloc functions.
+##
+## This function is only called if one or more modules set the X_VX_NextFrm_Reinit_Req 
+## flag (in the Frame function).
+## When this happens, all modules' PreMalloc functions get called so that each module 
+## has the chance to ask for heap memory.
+## 
+## If this function gets called, the OS has already freed all of the heap, and all heap-using modules
+## MUST request heap again.
+##
+## Examples of Heap Requests:
+## 
+#####  Example 1:  Request 512 words from XMEM
+#####  i0 = (VX_Buffer_0_Ptr) ### Os place the address of the malloced RAM in this var in XRAM
+#####  uhalfword(x0) = (0x200)
+#####  call cl_mallocX
+
+#####  Example 2:  Request 768 words from YMEM
+#####  i0 = (VX_Buffer_1_Ptr) ### Os place the address of the malloced RAM in this var in XRAM
+#####  uhalfword(x0) = (0x300)
+#####  call cl_mallocY
+
+#####  Example 3:  Request 512 of words from XMEM aligned to a modulo boundary
+#####  i0 = (VX_Buffer_2_Ptr) ### Os place the address of the malloced RAM in this var in XRAM
+#####  uhalfword(x0) = (0x200)
+#####  call cl_mallocModX
+
+#####  Example 4:  Request 64 words from LMEM aligned to a modulo boundary
+#####  i0 = (VX_Buffer_3_Ptr) ### Os place the address of the malloced RAM in this var in XRAM
+#####  uhalfword(x0) = (64)
+#####  call cl_mallocModL
+
+### There are 6 types of malloc requests: X, Y, L modulo and non-modulo
+### Mallocation is all or nothing.  If there is not enough available heap to accomodate
+### the entire set of requests, the systems halts.
+
+### If the Malloc succeeds, the OS calls the Post Malloc functions.
+#################################################################################
+	.public X_S_example_module_PreMalloc
+X_S_example_module_PreMalloc:
+#   <your code here>
+X_S_example_module_PreMalloc_Done:
+  ret
+
+##################################################################################
+## Called from the Brick or Foreground ISR
+## Called if the mallocations requested by the modules' Pre-Mallocs succeeds
+## This gives the module designer a chance to act upon the newly acquired buffers
+## if so desired.  For example, a malloced example_module-filter history-buffer should be 
+## cleared here.
+##
+## This function is also a good place to set a malloc-success flag for the benefit
+## of the Block function.  That is, the Block function should never try to operate on
+## a buffer that has not yet been malloced
+#################################################################################
+	.public X_S_example_module_PostMalloc
+X_S_example_module_PostMalloc:
+#   <your code here>
+X_S_example_module_PostMalloc_Done:
+  ret
+
+###############################################################################
+## Unconditional initializations (i.e., vars whose values don't depend on MCV)
+## This function gets called before the KickStart message is received and acted-on
+## Called only when the OS re-boots
+###############################################################################
+	.public X_S_example_module_PreKickstart
+X_S_example_module_PreKickstart:
+#   <your code here>
+X_S_example_module_PreKickstart_done:
+  
+  ret
+
+
+###############################################################################
+## Unconditional initializations (i.e., vars whose values don't depend on MCV)
+##    OR
+## Conditional initializations (i.e., vars whose values depend on MCV)
+##
+## This function gets called immediately after the KickStart message is received
+## by the OS and acted-on (i.e., prior to any other Framework Entry-point).
+##
+## This function also gets called upon App-Restart (which happens after recovering 
+## from an audio under-flow).
+##
+## This function gets called before any block-processing functions are called.
+##
+## An example of the kind of initialization that must happen here would be any 
+## filter state that must be cleared prior to starting audio again. 
+###############################################################################
+	.public X_S_example_module_PostKickstart
+X_S_example_module_PostKickstart:
+	call X_S_example_module_Background
+X_S_example_module_PostKickstart_done:
+                     
+  ret
